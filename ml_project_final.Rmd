@@ -1,0 +1,147 @@
+---
+title: "Predicting Manner of Exercise based on Wearable Instrumentation."
+author: "anielsen108"
+date: "May 9, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE)
+```
+### Synopsis
+The goal is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants, in order to predict the manner in which they did the exercise. 
+
+The classifications of manners ("classe" variable in the training set) are:
+
+* Class A: exactly according to the specification
+* Class B: throwing the elbows to the front
+* Class C: Lifting the dumbbell only halfway
+* Class D: lowering the dumbbell only halfway
+* Class E: throwing the hips to the front
+
+The above is from information on the experiments: http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises
+
+####  General Setup
+```{r require, eval=TRUE, message=FALSE}
+require(caret)
+require(randomForest)
+require(gbm)
+require(MASS)
+numFolds <- 5 # Number of folds to use in k-fold cross-validation
+set.seed(32323) # Random seed parameter, to allow Random Forest reproducibility.
+```
+##### Download training and testing data
+```{r download, eval=FALSE}
+download.file('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv', 'pml-training.csv')
+download.file('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv', 'pml-testing.csv')
+```
+
+##### Prepare dataset by reducing to valid instrumentation variables
+```{r read_in}
+# Read in training and test cases data
+fullTraining <- read.csv('pml-training.csv', na.strings = c('','NA'))
+testCases <- read.csv('pml-testing.csv', na.strings = c('','NA'))
+
+# Remove variables which are just NA for datasets
+na_count <- apply(fullTraining, 2, function(colName) sum(is.na(colName)))
+na_count <- na_count[which(na_count == 0)]
+dataset <- fullTraining[,names(na_count)]
+
+na_count <- apply(testCases, 2, function(colName) sum(is.na(colName)))
+na_count <- na_count[which(na_count == 0)]
+testCases <- testCases[,names(na_count)]
+
+# Throw out variables that are not instrumentation data
+dataset <-  subset(dataset, select = -c(X, user_name, raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp, new_window, num_window) )
+testCases <-  subset(testCases, select = -c(X, user_name, raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp, new_window, num_window) )
+
+```
+#### Modeling and Cross-Validation approach
+As this is a classification problem, we are going to try three approaches:  
+* Random Forest (rf)  
+* Gradient Boosting Machine (gbm)  
+* Linear Discriminant Anlysis  
+
+We will try all three approaches indiviually, and additionally explore the General Additive Model (gam) of all three combines (comb).
+
+Our approach will perform cross-validation on `r numFolds ` folds.
+
+#### Fitting Models and Expected Out-Of-Sample Error
+```{r modeling, message=FALSE, warning=FALSE, results='hide'}
+# Dimension variables to hold results for each fold
+testIndexes <- testing <- training <- 
+rfFit <- gbmFit <- ldaFit <- combFit <- 
+rfPred <- gbmPred <- ldaPred <- combPred <- 
+predDF <- 
+cmrf <- cmgbm <- cmlda <- cmcomb <- 
+accrf <- accgbm <- acclda <- acccomb <- 
+errRate <- vector("list", numFolds)
+
+# Create Folds
+testFolds <- createFolds(dataset$classe, k=numFolds, list=TRUE, returnTrain=FALSE)
+
+for(i in 1:numFolds){
+        
+        # Create testing & training set based on this fold
+        testing[[i]] <- dataset[testFolds[[i]], ]
+        training[[i]] <- dataset[-testFolds[[i]], ]
+    
+        # Fit with Random Forest (rf), Gradient Boosting Machine (gbm), and Linear Discriminant Analysis (lda)
+        rfFit[[i]] <- train(classe ~ . , method="rf", data=training[[i]])
+        gbmFit[[i]] <- train(classe ~ . , method="gbm", data=training[[i]])
+        ldaFit[[i]] <- train( classe ~ . , method="lda", data=training[[i]])
+  
+        # predict
+        rfPred[[i]] <- predict(rfFit[[i]],testing[[i]])
+        gbmPred[[i]] <- predict(gbmFit[[i]],testing[[i]] )
+        ldaPred[[i]] <- predict(ldaFit[[i]],testing[[i]] )  
+   
+        # get combination prediction model with Generalized Additive Model (gam) 
+        predDF[[i]] <- data.frame(
+                rf = rfPred[[i]], 
+                gbm = gbmPred[[i]], 
+                lda = ldaPred[[i]], 
+                actual = testing[[i]]$classe)
+        combFit[[i]] <- train(actual ~ .,method="gam", data=predDF[[i]])
+        combPred[[i]] <- predict(combFit[[i]],predDF[[i]])
+
+        # Output accuracy of prediction
+        cmrf[[i]] <- confusionMatrix(testing[[i]]$classe, rfPred[[i]])
+        cmgbm[[i]] <- confusionMatrix(testing[[i]]$classe, gbmPred[[i]])
+        cmlda[[i]] <- confusionMatrix(testing[[i]]$classe, ldaPred[[i]])
+        cmcomb[[i]] <- confusionMatrix(testing[[i]]$classe, combPred[[i]])
+        
+        accrf <- cmrf[[i]]$overall["Accuracy"]
+        accgbm <- cmgbm[[i]]$overall["Accuracy"]
+        acclda <- cmlda[[i]]$overall["Accuracy"]
+        acccomb <- cmcomb[[i]]$overall["Accuracy"]
+
+        # Expected Out-of-sample error is 1 - accuracy
+        errRate[[i]]$error_rf <- 1-accrf
+        errRate[[i]]$error_gbm <- 1-accgbm
+        errRate[[i]]$error_lda <- 1-acclda
+        errRate[[i]]$error_comb <- 1-acccomb
+}
+```
+
+#### Error Rate for each model, by fold
+```{r error_rate}
+# Error Rate of models, by fold
+errDF <- do.call(cbind,errRate)
+errDF <- apply(errDF, 2, as.numeric)
+row.names(errDF) <- c("rf","gbm","lda","comb")
+
+print(errDF)
+```
+
+#### Prediction of Test Cases, by Random Forest
+Rationale for choice: Random Forest generally gives a higher accuracy than Generalized Boosting Machine, Linear Discrimant Analysis, or a General Additive Model of all.
+```{r fit_test_cases, results='hide'}
+rfFitAll <- train(classe ~ . , method="rf", data=dataset)
+testCasesPred <- predict(rfFitAll,testCases)
+```
+
+Prediction of 20 test cases:
+```{r predict_test_cases}
+print(testCasesPred)
+```
